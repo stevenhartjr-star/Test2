@@ -6,9 +6,10 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { ChatMessage, MessageSender, URLGroup } from './types';
-import { generateContentWithUrlContext, getInitialSuggestions, getSummaryForUrls } from './services/geminiService';
+import { generateContentWithContext, getInitialSuggestions, getSummaryForUrls } from './services/geminiService';
 import KnowledgeBaseManager from './components/KnowledgeBaseManager';
 import ChatInterface from './components/ChatInterface';
+import { Part } from '@google/genai';
 
 const GEMINI_DOCS_URLS = [
   "https://ai.google.dev/gemini-api/docs",
@@ -41,9 +42,61 @@ const MODEL_CAPABILITIES_URLS = [
 ];
 
 const INITIAL_URL_GROUPS: URLGroup[] = [
-  { id: 'gemini-overview', name: 'Gemini Docs Overview', urls: GEMINI_DOCS_URLS },
-  { id: 'model-capabilities', name: 'Model Capabilities', urls: MODEL_CAPABILITIES_URLS },
+  { id: 'gemini-overview', name: 'Gemini Docs Overview', urls: GEMINI_DOCS_URLS, files: [] },
+  { id: 'model-capabilities', name: 'Model Capabilities', urls: MODEL_CAPABILITIES_URLS, files: [] },
 ];
+
+const MAX_URLS = 20;
+const MAX_FILES = 50;
+
+// Helper to read file as Base64 (for Images, PDFs)
+const readFileAsBase64 = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Remove data URL prefix (e.g. "data:image/png;base64,")
+      const base64 = result.split(',')[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+};
+
+// Helper to read file as Text (for code, txt, etc)
+const readFileAsText = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+};
+
+const fileToPart = async (file: File): Promise<Part> => {
+  // Simple heuristic for mime types
+  const isImage = file.type.startsWith('image/');
+  const isPdf = file.type === 'application/pdf';
+  const isAudio = file.type.startsWith('audio/');
+  const isVideo = file.type.startsWith('video/');
+  
+  if (isImage || isPdf || isAudio || isVideo) {
+    const base64Data = await readFileAsBase64(file);
+    return {
+      inlineData: {
+        mimeType: file.type || 'application/octet-stream',
+        data: base64Data
+      }
+    };
+  } else {
+    // Treat as text/code
+    const text = await readFileAsText(file);
+    return {
+      text: `File: ${file.name}\nContent:\n${text}\n---\n`
+    };
+  }
+};
 
 const App: React.FC = () => {
   const [urlGroups, setUrlGroups] = useState<URLGroup[]>(INITIAL_URL_GROUPS);
@@ -55,17 +108,16 @@ const App: React.FC = () => {
   const [isFetchingSuggestions, setIsFetchingSuggestions] = useState(false);
   const [initialQuerySuggestions, setInitialQuerySuggestions] = useState<string[]>([]);
   
-  const MAX_URLS = 20;
-
   const activeGroup = urlGroups.find(group => group.id === activeUrlGroupId);
   const currentUrlsForChat = activeGroup ? activeGroup.urls : [];
+  const currentFilesForChat = activeGroup ? activeGroup.files : [];
 
    useEffect(() => {
     const apiKey = process.env.API_KEY;
     const currentActiveGroup = urlGroups.find(group => group.id === activeUrlGroupId);
     const welcomeMessageText = !apiKey 
-        ? 'ERROR: Gemini API Key (process.env.API_KEY) is not configured. Please set this environment variable to use the application.'
-        : `Welcome to Documentation Browser! You're currently browsing content from: "${currentActiveGroup?.name || 'None'}". Just ask me questions, or try one of the suggestions below to get started`;
+        ? 'Error: Gemini API Key (process.env.API_KEY) is not configured. Please set this environment variable to use the application.'
+        : `Welcome! You're currently browsing "${currentActiveGroup?.name || 'Unknown'}". Add URLs or upload files/folders to ask questions about them.`;
     
     setChatMessages([{
       id: `system-welcome-${activeUrlGroupId}-${Date.now()}`,
@@ -77,6 +129,7 @@ const App: React.FC = () => {
 
 
   const fetchAndSetInitialSuggestions = useCallback(async (currentUrls: string[]) => {
+    if (!process.env.API_KEY) return;
     if (currentUrls.length === 0) {
       setInitialQuerySuggestions([]);
       return;
@@ -99,19 +152,14 @@ const App: React.FC = () => {
           const parsed = JSON.parse(jsonStr);
           if (parsed && Array.isArray(parsed.suggestions)) {
             suggestionsArray = parsed.suggestions.filter((s: unknown) => typeof s === 'string');
-          } else {
-            console.warn("Parsed suggestions response, but 'suggestions' array not found or invalid:", parsed);
-             setChatMessages(prev => [...prev, { id: `sys-err-suggestion-fmt-${Date.now()}`, text: "Received suggestions in an unexpected format.", sender: MessageSender.SYSTEM, timestamp: new Date() }]);
           }
         } catch (parseError) {
-          console.error("Failed to parse suggestions JSON:", parseError, "Raw text:", response.text);
-          setChatMessages(prev => [...prev, { id: `sys-err-suggestion-parse-${Date.now()}`, text: "Error parsing suggestions from AI.", sender: MessageSender.SYSTEM, timestamp: new Date() }]);
+          console.warn("Failed to parse suggestions JSON.");
         }
       }
       setInitialQuerySuggestions(suggestionsArray.slice(0, 4)); 
     } catch (e: any) {
-      const errorMessage = e.message || 'Failed to fetch initial suggestions.';
-      setChatMessages(prev => [...prev, { id: `sys-err-suggestion-fetch-${Date.now()}`, text: `Error fetching suggestions: ${errorMessage}`, sender: MessageSender.SYSTEM, timestamp: new Date() }]);
+      console.warn("Could not fetch suggestions:", e.message);
     } finally {
       setIsFetchingSuggestions(false);
     }
@@ -150,15 +198,51 @@ const App: React.FC = () => {
       })
     );
   };
+  
+  const handleAddFiles = (newFiles: File[]) => {
+    setUrlGroups(prevGroups => 
+      prevGroups.map(group => {
+        if (group.id === activeUrlGroupId) {
+          const combinedFiles = [...group.files, ...newFiles];
+          if (combinedFiles.length > MAX_FILES) {
+             return { ...group, files: combinedFiles.slice(0, MAX_FILES) };
+          }
+          return { ...group, files: combinedFiles };
+        }
+        return group;
+      })
+    );
+  };
+
+  const handleRemoveFile = (fileName: string) => {
+    setUrlGroups(prevGroups => 
+      prevGroups.map(group => {
+        if (group.id === activeUrlGroupId) {
+          return { ...group, files: group.files.filter(f => f.name !== fileName) };
+        }
+        return group;
+      })
+    );
+  };
 
   const handleSendMessage = async (query: string) => {
     if (!query.trim() || isLoading || isFetchingSuggestions) return;
+
+    if (!navigator.onLine) {
+        setChatMessages(prev => [...prev, {
+            id: `sys-offline-${Date.now()}`,
+            text: 'Error: You appear to be offline. Please check your internet connection.',
+            sender: MessageSender.SYSTEM,
+            timestamp: new Date(),
+        }]);
+        return;
+    }
 
     const apiKey = process.env.API_KEY;
     if (!apiKey) {
        setChatMessages(prev => [...prev, {
         id: `error-apikey-${Date.now()}`,
-        text: 'ERROR: API Key (process.env.API_KEY) is not configured. Please set it up to send messages.',
+        text: 'Error: API Key is not configured.',
         sender: MessageSender.SYSTEM,
         timestamp: new Date(),
       }]);
@@ -186,7 +270,14 @@ const App: React.FC = () => {
     setChatMessages(prevMessages => [...prevMessages, userMessage, modelPlaceholderMessage]);
 
     try {
-      const response = await generateContentWithUrlContext(query, currentUrlsForChat);
+      // Process files into Parts
+      let fileParts: Part[] = [];
+      if (currentFilesForChat.length > 0) {
+        fileParts = await Promise.all(currentFilesForChat.map(f => fileToPart(f)));
+      }
+
+      const response = await generateContentWithContext(query, currentUrlsForChat, fileParts);
+      
       setChatMessages(prevMessages =>
         prevMessages.map(msg =>
           msg.id === modelPlaceholderMessage.id
@@ -195,10 +286,11 @@ const App: React.FC = () => {
         )
       );
     } catch (e: any) {
-      const errorMessage = e.message || 'Failed to get response from AI.';
+      const errorMessage = e.message || 'An unexpected error occurred.';
       setChatMessages(prevMessages =>
         prevMessages.map(msg =>
           msg.id === modelPlaceholderMessage.id
+            // Prepends "Error: " so MessageItem can detect it for styling
             ? { ...modelPlaceholderMessage, text: `Error: ${errorMessage}`, sender: MessageSender.SYSTEM, isLoading: false } 
             : msg
         )
@@ -225,7 +317,7 @@ const App: React.FC = () => {
         )
       );
     } catch (e: any) {
-      const errorMessage = e.message || "Failed to generate summary.";
+       const errorMessage = e.message || "Failed to generate summary.";
       setChatMessages(prevMessages => 
         prevMessages.map(msg => 
           msg.id === messageId ? { ...msg, isSummarizing: false, summary: `Error: ${errorMessage}` } : msg
@@ -238,15 +330,16 @@ const App: React.FC = () => {
     handleSendMessage(query);
   };
   
-  const chatPlaceholder = currentUrlsForChat.length > 0 
+  const hasContent = currentUrlsForChat.length > 0 || currentFilesForChat.length > 0;
+  
+  const chatPlaceholder = hasContent 
     ? `Ask questions about "${activeGroup?.name || 'current documents'}"...`
-    : "Select a group and/or add URLs to the knowledge base to enable chat.";
+    : "Add URLs or upload files to the knowledge base to enable chat.";
 
   return (
     <div 
       className="h-screen max-h-screen antialiased relative overflow-x-hidden bg-[#121212] text-[#E2E2E2]"
     >
-      {/* Overlay for mobile */}
       {isSidebarOpen && (
         <div 
           className="fixed inset-0 bg-black/60 z-20 md:hidden"
@@ -256,7 +349,6 @@ const App: React.FC = () => {
       )}
       
       <div className="flex h-full w-full md:p-4 md:gap-4">
-        {/* Sidebar */}
         <div className={`
           fixed top-0 left-0 h-full w-11/12 max-w-sm z-30 transform transition-transform ease-in-out duration-300 p-3
           md:static md:p-0 md:w-1/3 lg:w-1/4 md:h-full md:max-w-none md:translate-x-0 md:z-auto
@@ -266,6 +358,9 @@ const App: React.FC = () => {
             urls={currentUrlsForChat}
             onAddUrl={handleAddUrl}
             onRemoveUrl={handleRemoveUrl}
+            files={currentFilesForChat}
+            onAddFiles={handleAddFiles}
+            onRemoveFile={handleRemoveFile}
             maxUrls={MAX_URLS}
             urlGroups={urlGroups}
             activeUrlGroupId={activeUrlGroupId}
@@ -274,7 +369,6 @@ const App: React.FC = () => {
           />
         </div>
 
-        {/* Chat Interface */}
         <div className="w-full h-full p-3 md:p-0 md:w-2/3 lg:w-3/4">
           <ChatInterface
             messages={chatMessages}

@@ -5,7 +5,7 @@
 */
 
 
-import { GoogleGenAI, GenerateContentResponse, Tool, HarmCategory, HarmBlockThreshold, Content } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse, Tool, HarmCategory, HarmBlockThreshold, Content, Part } from "@google/genai";
 import { UrlContextMetadataItem } from '../types';
 
 // IMPORTANT: The API key MUST be set as an environment variable `process.env.API_KEY`
@@ -19,7 +19,7 @@ const MODEL_NAME = "gemini-2.5-flash";
 const getAiInstance = (): GoogleGenAI => {
   if (!API_KEY) {
     console.error("API_KEY is not set in environment variables. Please set process.env.API_KEY.");
-    throw new Error("Gemini API Key not configured. Set process.env.API_KEY.");
+    throw new Error("Gemini API Key not configured. Please check your environment settings.");
   }
   if (!ai) {
     ai = new GoogleGenAI({ apiKey: API_KEY });
@@ -39,9 +39,44 @@ interface GeminiResponse {
   urlContextMetadata?: UrlContextMetadataItem[];
 }
 
-export const generateContentWithUrlContext = async (
+// Helper to format errors into user-friendly messages
+const formatGeminiError = (error: any): string => {
+  console.error("Gemini API Error Details:", error);
+  
+  if (error instanceof Error) {
+    const msg = error.message;
+    const lowerMsg = msg.toLowerCase();
+
+    if (lowerMsg.includes('403') || lowerMsg.includes('api key')) {
+      return 'Authentication failed. Please verify your API Key.';
+    }
+    if (lowerMsg.includes('429') || lowerMsg.includes('quota')) {
+      return 'Usage limit exceeded. Please try again later.';
+    }
+    if (lowerMsg.includes('503') || lowerMsg.includes('service unavailable') || lowerMsg.includes('overloaded')) {
+      return 'The AI service is temporarily unavailable. Please try again in a few moments.';
+    }
+    if (lowerMsg.includes('network') || lowerMsg.includes('fetch failed') || lowerMsg.includes('failed to fetch')) {
+      return 'Network connection failed. Please check your internet connection.';
+    }
+    if (lowerMsg.includes('safety') || lowerMsg.includes('blocked')) {
+      return 'The content was blocked due to safety policies. Please try a different prompt.';
+    }
+    if (lowerMsg.includes('candidate')) {
+        return 'The model could not generate a valid response for this request.';
+    }
+    
+    // Clean up generic GoogleGenAIError prefixes if present
+    return msg.replace(/\[.*?\]\s*/, '').replace(/^GoogleGenAIError:\s*/, '');
+  }
+  
+  return 'An unexpected error occurred while communicating with the AI service.';
+};
+
+export const generateContentWithContext = async (
   prompt: string,
-  urls: string[]
+  urls: string[],
+  fileParts: Part[] = []
 ): Promise<GeminiResponse> => {
   const currentAi = getAiInstance();
   
@@ -51,8 +86,21 @@ export const generateContentWithUrlContext = async (
     fullPrompt = `${prompt}\n\nRelevant URLs for context:\n${urlList}`;
   }
 
-  const tools: Tool[] = [{ urlContext: {} }];
-  const contents: Content[] = [{ role: "user", parts: [{ text: fullPrompt }] }];
+  // Configure tools only if URLs are present (URL Context tool)
+  // If we have fileParts, we pass them in contents.
+  const tools: Tool[] | undefined = urls.length > 0 ? [{ urlContext: {} }] : undefined;
+
+  const parts: Part[] = [];
+  
+  // Add file parts (images, pdfs, text files)
+  if (fileParts.length > 0) {
+    parts.push(...fileParts);
+  }
+
+  // Add the prompt
+  parts.push({ text: fullPrompt });
+
+  const contents: Content[] = [{ role: "user", parts: parts }];
 
   try {
     const response: GenerateContentResponse = await currentAi.models.generateContent({
@@ -64,64 +112,49 @@ export const generateContentWithUrlContext = async (
       },
     });
 
-    const text = response.text;
+    const text = response.text || ""; 
+    // Check if text is empty but no error thrown (e.g. strict safety filter on output)
+    if (!text && response.candidates && response.candidates.length > 0 && response.candidates[0].finishReason !== "STOP") {
+         throw new Error(`Response stopped due to: ${response.candidates[0].finishReason}`);
+    }
+
     const candidate = response.candidates?.[0];
     let extractedUrlContextMetadata: UrlContextMetadataItem[] | undefined = undefined;
 
     if (candidate && candidate.urlContextMetadata && candidate.urlContextMetadata.urlMetadata) {
-      console.log("Raw candidate.urlContextMetadata.urlMetadata from API/SDK:", JSON.stringify(candidate.urlContextMetadata.urlMetadata, null, 2));
-      // Assuming SDK converts snake_case to camelCase, UrlContextMetadataItem type (now camelCase) should match items in urlMetadata.
-      extractedUrlContextMetadata = candidate.urlContextMetadata.urlMetadata as UrlContextMetadataItem[];
-    } else if (candidate && candidate.urlContextMetadata) {
-      // This case implies urlContextMetadata exists but urlMetadata field might be missing or empty.
-      console.warn("candidate.urlContextMetadata is present, but 'urlMetadata' field is missing or empty:", JSON.stringify(candidate.urlContextMetadata, null, 2));
-    } else {
-      // console.log("No urlContextMetadata found in the Gemini API response candidate.");
+       extractedUrlContextMetadata = candidate.urlContextMetadata.urlMetadata as UrlContextMetadataItem[];
     }
     
     return { text, urlContextMetadata: extractedUrlContextMetadata };
 
   } catch (error) {
-    console.error("Error calling Gemini API:", error);
-    if (error instanceof Error) {
-      const googleError = error as any; 
-      if (googleError.message && googleError.message.includes("API key not valid")) {
-         throw new Error("Invalid API Key. Please check your GEMINI_API_KEY environment variable.");
-      }
-      if (googleError.message && googleError.message.includes("quota")) {
-        throw new Error("API quota exceeded. Please check your Gemini API quota.");
-      }
-      if (googleError.type === 'GoogleGenAIError' && googleError.message) {
-        throw new Error(`Gemini API Error: ${googleError.message}`);
-      }
-      throw new Error(`Failed to get response from AI: ${error.message}`);
-    }
-    throw new Error("Failed to get response from AI due to an unknown error.");
+    throw new Error(formatGeminiError(error));
   }
 };
+
+// Kept for backward compatibility if needed, but App.tsx will switch to generateContentWithContext
+export const generateContentWithUrlContext = (prompt: string, urls: string[]) => {
+  return generateContentWithContext(prompt, urls, []);
+}
 
 export const getSummaryForUrls = async (urls: string[]): Promise<string> => {
   try {
     const prompt = "Please provide a concise and clear summary of the key information contained in the following URLs. Focus on the main topics and takeaways.";
-    const response = await generateContentWithUrlContext(prompt, urls);
+    const response = await generateContentWithContext(prompt, urls);
     return response.text || "No summary available.";
   } catch (error) {
-    console.error("Error getting summary:", error);
-    throw new Error("Failed to generate summary.");
+     throw new Error(formatGeminiError(error));
   }
 };
 
-// This function now aims to get a JSON array of string suggestions.
 export const getInitialSuggestions = async (urls: string[]): Promise<GeminiResponse> => {
   if (urls.length === 0) {
-    // This case should ideally be handled by the caller, but as a fallback:
-    return { text: JSON.stringify({ suggestions: ["Add some URLs to get topic suggestions."] }) };
+    return { text: JSON.stringify({ suggestions: ["Add some URLs or Files to get topic suggestions."] }) };
   }
   const currentAi = getAiInstance();
   const urlList = urls.join('\n');
   
-  // Prompt updated to request JSON output of short questions
-  const promptText = `Based on the content of the following documentation URLs, provide 3-4 concise and actionable questions a developer might ask to explore these documents. These questions should be suitable as quick-start prompts. Return ONLY a JSON object with a key "suggestions" containing an array of these question strings. For example: {"suggestions": ["What are the rate limits?", "How do I get an API key?", "Explain model X."]}
+  const promptText = `Based on the content of the following documentation URLs, provide 3-4 concise and actionable questions a developer might ask to explore these documents. Return ONLY a JSON object with a key "suggestions".
 
 Relevant URLs:
 ${urlList}`;
@@ -134,29 +167,16 @@ ${urlList}`;
       contents: contents,
       config: {
         safetySettings: safetySettings,
-        responseMimeType: "application/json", // Request JSON output
+        responseMimeType: "application/json", 
       },
     });
 
-    const text = response.text; // This should be the JSON string
-    // urlContextMetadata is not expected here because tools cannot be used with responseMimeType: "application/json"
-    // const urlContextMetadata = response.candidates?.[0]?.urlContextMetadata?.urlMetadata as UrlContextMetadataItem[] | undefined;
-    
-    return { text /*, urlContextMetadata: undefined */ }; // Explicitly undefined or not included
+    return { text: response.text }; 
 
   } catch (error) {
-    console.error("Error calling Gemini API for initial suggestions:", error);
-     if (error instanceof Error) {
-      const googleError = error as any; 
-      if (googleError.message && googleError.message.includes("API key not valid")) {
-         throw new Error("Invalid API Key for suggestions. Please check your GEMINI_API_KEY environment variable.");
-      }
-      // Check for the specific error message and re-throw a more informative one if needed
-      if (googleError.message && googleError.message.includes("Tool use with a response mime type: 'application/json' is unsupported")) {
-        throw new Error("Configuration error: Cannot use tools with JSON response type for suggestions. This should be fixed in the code.");
-      }
-      throw new Error(`Failed to get initial suggestions from AI: ${error.message}`);
-    }
-    throw new Error("Failed to get initial suggestions from AI due to an unknown error.");
+     // Log the error but throw a friendly one
+    console.warn("Failed to fetch suggestions:", error);
+    // Suggestions are non-critical, so we might want to return a fallback or throw a soft error
+    throw new Error(formatGeminiError(error));
   }
 };

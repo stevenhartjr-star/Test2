@@ -30,4 +30,5 @@ export interface URLGroup {
   id: string;
   name: string;
   urls: string[];
+  files: File[];
 }
